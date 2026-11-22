@@ -200,7 +200,7 @@ int real_main(int argc, char *argv[])
 	// Gamefa (2026-11-22): the Gamefa app's own «اتصال به PS5» drives these, as its phone app does:
 	//   chiaki regist --host <ip> --accountid <base64> --pin <8 digits> [--ps5] --out <file.json>
 	//   chiaki wakeup --host <ip> --registkeyhex <hex> [--ps5]
-	//   chiaki stream --ps5 --registkeyhex <hex> --morning <base64> <nickname> <host>
+	//   chiaki stream --ps5 --registkeyhex <hex> --morning <base64> [--resolution 720|1080] [--fps 30|60] <nickname> <host>
 	QCommandLineOption gf_ps5_option("ps5", "The console is a PS5 (stream with --registkey/--registkeyhex, regist, wakeup).");
 	parser.addOption(gf_ps5_option);
 	QCommandLineOption gf_regist_key_hex_option("registkeyhex", "The regist key, as hex (as regist prints it).", "hex");
@@ -213,6 +213,11 @@ int real_main(int argc, char *argv[])
 	parser.addOption(gf_pin_option);
 	QCommandLineOption gf_out_option("out", "Where regist writes its result (JSON).", "file");
 	parser.addOption(gf_out_option);
+	// (Gamefa: the picture the PS5 sends - 720 or 1080, 30 or 60 frames a second - chosen in the Gamefa app)
+	QCommandLineOption gf_resolution_option("resolution", "PS5 stream resolution: 720 or 1080 (stream).", "p");
+	parser.addOption(gf_resolution_option);
+	QCommandLineOption gf_fps_option("fps", "PS5 stream frames per second: 30 or 60 (stream).", "fps");
+	parser.addOption(gf_fps_option);
 
 	parser.process(app);
 	QStringList args = parser.positionalArguments();
@@ -334,6 +339,22 @@ int real_main(int argc, char *argv[])
 			}
 		}
 		
+		// Gamefa: the quality asked for, kept in this profile's settings (read by the session's video profile)
+		{
+			Settings *gs = use_alt_settings ? &alt_settings : &settings;
+			if(parser.isSet(gf_resolution_option))
+			{
+				ChiakiVideoResolutionPreset r = parser.value(gf_resolution_option) == "720" ? CHIAKI_VIDEO_RESOLUTION_PRESET_720p : CHIAKI_VIDEO_RESOLUTION_PRESET_1080p;
+				gs->SetResolutionLocalPS5(r);
+				gs->SetResolutionRemotePS5(r);
+			}
+			if(parser.isSet(gf_fps_option))
+			{
+				ChiakiVideoFPSPreset f = parser.value(gf_fps_option) == "30" ? CHIAKI_VIDEO_FPS_PRESET_30 : CHIAKI_VIDEO_FPS_PRESET_60;
+				gs->SetFPSLocalPS5(f);
+				gs->SetFPSRemotePS5(f);
+			}
+		}
 		StreamSessionConnectInfo connect_info(
 				use_alt_settings ? &alt_settings : &settings,
 				target,
