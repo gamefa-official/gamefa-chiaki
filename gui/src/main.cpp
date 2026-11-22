@@ -62,6 +62,8 @@ static const QMap<QString, CLICommand> cli_commands = {
 #endif
 
 int RunStream(QGuiApplication &app, const StreamSessionConnectInfo &connect_info);
+static int GamefaRegist(const QString &host, const QString &account_b64, const QString &pin, bool ps5, const QString &out);
+static int GamefaWakeup(const QString &host, const QString &regist_key_hex, bool ps5);
 int RunMain(QGuiApplication &app, Settings *settings, bool exit_app_on_stream_exit);
 
 int real_main(int argc, char *argv[])
@@ -195,6 +197,23 @@ int real_main(int argc, char *argv[])
 	QCommandLineOption opengl_option("opengl", "Switch the renderer to OpenGL from now on, for systems where Vulkan shows a blank window or crashes (switch back under Settings > Video > Renderer Backend).");
 	parser.addOption(opengl_option);
 
+	// Gamefa (2026-11-22): the Gamefa app's own «اتصال به PS5» drives these, as its phone app does:
+	//   chiaki regist --host <ip> --accountid <base64> --pin <8 digits> [--ps5] --out <file.json>
+	//   chiaki wakeup --host <ip> --registkeyhex <hex> [--ps5]
+	//   chiaki stream --ps5 --registkeyhex <hex> --morning <base64> <nickname> <host>
+	QCommandLineOption gf_ps5_option("ps5", "The console is a PS5 (stream with --registkey/--registkeyhex, regist, wakeup).");
+	parser.addOption(gf_ps5_option);
+	QCommandLineOption gf_regist_key_hex_option("registkeyhex", "The regist key, as hex (as regist prints it).", "hex");
+	parser.addOption(gf_regist_key_hex_option);
+	QCommandLineOption gf_host_option("host", "The console's address (regist, wakeup).", "host");
+	parser.addOption(gf_host_option);
+	QCommandLineOption gf_account_option("accountid", "The PSN Account-ID, base64 (regist).", "accountid");
+	parser.addOption(gf_account_option);
+	QCommandLineOption gf_pin_option("pin", "The 8-digit pairing PIN the console shows (regist).", "pin");
+	parser.addOption(gf_pin_option);
+	QCommandLineOption gf_out_option("out", "Where regist writes its result (JSON).", "file");
+	parser.addOption(gf_out_option);
+
 	parser.process(app);
 	QStringList args = parser.positionalArguments();
 
@@ -226,6 +245,11 @@ int real_main(int argc, char *argv[])
 			printf("Host: %s \n", host.GetServerNickname().toLocal8Bit().constData());
 		return 0;
 	}
+	if(args[0] == "regist")
+		return GamefaRegist(parser.value(gf_host_option), parser.value(gf_account_option), parser.value(gf_pin_option), parser.isSet(gf_ps5_option), parser.value(gf_out_option));
+	if(args[0] == "wakeup")
+		return GamefaWakeup(parser.value(gf_host_option), parser.value(gf_regist_key_hex_option), parser.isSet(gf_ps5_option));
+
 	if(args[0] == "stream")
 	{
 		if(args.length() < 2)
@@ -238,7 +262,7 @@ int real_main(int argc, char *argv[])
 		QString initial_login_passcode;
 		ChiakiTarget target = CHIAKI_TARGET_PS4_10;
 
-		if(parser.value(regist_key_option).isEmpty() && parser.value(morning_option).isEmpty())
+		if(parser.value(regist_key_option).isEmpty() && parser.value(gf_regist_key_hex_option).isEmpty() && parser.value(morning_option).isEmpty())
 		{
 			if(args.length() < 3)
 				parser.showHelp(1);
@@ -264,7 +288,14 @@ int real_main(int argc, char *argv[])
 		else
 		{
 			// TODO: explicit option for target
-			regist_key = parser.value(regist_key_option).toUtf8();
+			// (Gamefa: --ps5 says it; the key may come as hex, as regist prints it)
+			if(parser.isSet(gf_ps5_option))
+				target = CHIAKI_TARGET_PS5_1;
+			regist_key = parser.value(gf_regist_key_hex_option).isEmpty()
+				? parser.value(regist_key_option).toUtf8()
+				: QByteArray::fromHex(parser.value(gf_regist_key_hex_option).toUtf8());
+			while(regist_key.endsWith('\0'))
+				regist_key.chop(1);
 			if(regist_key.length() > sizeof(ChiakiConnectInfo::regist_key))
 			{
 				printf("Given regist key is too long (expected size <=%llu, got %" PRIdQSIZETYPE")\n",
@@ -356,4 +387,124 @@ int RunStream(QGuiApplication &app, const StreamSessionConnectInfo &connect_info
 	QmlMainWindow main_window(connect_info);
 	main_window.show();
 	return app.exec();
+}
+
+// ---- Gamefa (2026-11-22): pairing and wake-up from the command line
+
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <chiaki/discovery.h>
+
+namespace {
+struct GamefaRegistWait
+{
+	std::mutex m;
+	std::condition_variable cv;
+	bool done = false;
+	bool ok = false;
+	ChiakiRegisteredHost host = {};
+};
+
+void GamefaRegistCb(ChiakiRegistEvent *event, void *user)
+{
+	auto w = static_cast<GamefaRegistWait *>(user);
+	std::lock_guard<std::mutex> l(w->m);
+	w->ok = event->type == CHIAKI_REGIST_EVENT_TYPE_FINISHED_SUCCESS && event->registered_host;
+	if(w->ok)
+		w->host = *event->registered_host;
+	w->done = true;
+	w->cv.notify_all();
+}
+
+void GamefaWrite(const QString &out, const QJsonObject &o)
+{
+	QByteArray j = QJsonDocument(o).toJson(QJsonDocument::Compact);
+	if(!out.isEmpty())
+	{
+		QFile f(out);
+		if(f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+			f.write(j);
+	}
+	printf("%s\n", j.constData());
+	fflush(stdout);
+}
+}
+
+/** Pair with the console (its Pair Device PIN) by the PSN Account-ID: the keys to stream with, as JSON. */
+static int GamefaRegist(const QString &host, const QString &account_b64, const QString &pin, bool ps5, const QString &out)
+{
+	QByteArray account = QByteArray::fromBase64(account_b64.toUtf8());
+	if(host.isEmpty() || account.size() != CHIAKI_PSN_ACCOUNT_ID_SIZE || pin.length() != 8)
+	{
+		GamefaWrite(out, {{"ok", false}, {"error", "args"}});
+		return 2;
+	}
+	ChiakiRegistInfo info = {};
+	QByteArray hostb = host.toUtf8();
+	info.host = hostb.constData();
+	info.target = ps5 ? CHIAKI_TARGET_PS5_1 : CHIAKI_TARGET_PS4_10;
+	info.broadcast = false;
+	info.pin = (uint32_t)pin.toULong();
+	info.console_pin = 0;
+	info.holepunch_info = nullptr;
+	info.rudp = nullptr;
+	info.psn_online_id = nullptr;
+	memcpy(info.psn_account_id, account.constData(), CHIAKI_PSN_ACCOUNT_ID_SIZE);
+	ChiakiLog log;
+	chiaki_log_init(&log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE, chiaki_log_cb_print, nullptr);
+	ChiakiRegist regist;
+	GamefaRegistWait w;
+	if(chiaki_regist_start(&regist, &log, &info, GamefaRegistCb, &w) != CHIAKI_ERR_SUCCESS)
+	{
+		GamefaWrite(out, {{"ok", false}, {"error", "start"}});
+		return 1;
+	}
+	{
+		std::unique_lock<std::mutex> l(w.m);
+		w.cv.wait_for(l, std::chrono::seconds(60), [&] { return w.done; });
+	}
+	if(!w.done)
+		chiaki_regist_stop(&regist);
+	chiaki_regist_fini(&regist);
+	if(!w.ok)
+	{
+		GamefaWrite(out, {{"ok", false}, {"error", w.done ? "failed" : "timeout"}});
+		return 1;
+	}
+	QJsonObject o;
+	o["ok"] = true;
+	o["target"] = (int)w.host.target;
+	o["ps5"] = chiaki_target_is_ps5(w.host.target);
+	o["nickname"] = QString::fromUtf8(w.host.server_nickname, (int)strnlen(w.host.server_nickname, sizeof(w.host.server_nickname)));
+	o["mac"] = QString::fromLatin1(QByteArray((const char *)w.host.server_mac, sizeof(w.host.server_mac)).toHex(':'));
+	o["regist_key_hex"] = QString::fromLatin1(QByteArray(w.host.rp_regist_key, sizeof(w.host.rp_regist_key)).toHex());
+	o["regist_key"] = QString::fromLatin1(QByteArray(w.host.rp_regist_key, (int)strnlen(w.host.rp_regist_key, sizeof(w.host.rp_regist_key))));
+	o["rp_key_type"] = (int)w.host.rp_key_type;
+	o["morning"] = QString::fromLatin1(QByteArray((const char *)w.host.rp_key, sizeof(w.host.rp_key)).toBase64());
+	GamefaWrite(out, o);
+	return 0;
+}
+
+/** Wake a console in rest mode (the regist key, as regist printed it). */
+static int GamefaWakeup(const QString &host, const QString &regist_key_hex, bool ps5)
+{
+	QByteArray key = QByteArray::fromHex(regist_key_hex.toUtf8());
+	while(key.endsWith('\0'))
+		key.chop(1);
+	bool ok = false;
+	uint64_t credential = (uint64_t)QString::fromUtf8(key).toULongLong(&ok, 16);
+	if(host.isEmpty() || key.size() > 8 || !ok)
+	{
+		printf("{\"ok\":false,\"error\":\"args\"}\n");
+		return 2;
+	}
+	ChiakiLog log;
+	chiaki_log_init(&log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE, chiaki_log_cb_print, nullptr);
+	ChiakiErrorCode err = chiaki_discovery_wakeup(&log, nullptr, host.toUtf8().constData(), credential, ps5);
+	printf("{\"ok\":%s}\n", err == CHIAKI_ERR_SUCCESS ? "true" : "false");
+	return err == CHIAKI_ERR_SUCCESS ? 0 : 1;
 }
