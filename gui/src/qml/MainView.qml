@@ -421,7 +421,7 @@ Pane {
     Image {
         id: logoImage
         anchors.centerIn: parent
-        source: "qrc:/icons/chiaking-logo-white.svg"
+        source: "qrc:/icons/gamefa.png" // Gamefa (owner 2026-11-24)
         sourceSize: Qt.size(Math.min(parent.width, parent.height) / 2, Math.min(parent.width, parent.height) / 2)
 
         PropertyAnimation {

@@ -3129,7 +3129,7 @@ DialogView {
                     Layout.preferredWidth: 200
                     fillMode: Image.PreserveAspectFit
                     verticalAlignment: Image.AlignTop
-                    source: "qrc:icons/chiaking-logo.svg"
+                    source: "qrc:icons/gamefa.png" // Gamefa; the credits beside it stay (AGPL)
                 }
 
                 Label {

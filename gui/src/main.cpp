@@ -146,9 +146,9 @@ int real_main(int argc, char *argv[])
 	QApplication app(argc, argv);
 
 #ifdef Q_OS_MACOS
-	QGuiApplication::setWindowIcon(QIcon(":/icons/chiaking_macos.svg"));
+	QGuiApplication::setWindowIcon(QIcon(":/icons/gamefa.png")); // Gamefa (owner 2026-11-24: only the Gamefa logo, always)
 #else
-	QGuiApplication::setWindowIcon(QIcon(":/icons/chiaking.svg"));
+	QGuiApplication::setWindowIcon(QIcon(":/icons/gamefa.png")); // Gamefa (owner 2026-11-24: only the Gamefa logo, always)
 #endif
 
 	QCommandLineParser parser;
